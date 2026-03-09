@@ -30,13 +30,13 @@ os.makedirs('logs', exist_ok=True)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Define GNN model for embedding
+# Define GNN model
 class GNN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, embed_dim):
+    def __init__(self, in_channels, hidden_channels, embed_dim, out_channels):
         super().__init__()
         self.conv1 = SAGEConv(in_channels, hidden_channels)
         self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.lin = torch.nn.Linear(hidden_channels + embed_dim, embed_dim)
+        self.lin = torch.nn.Linear(hidden_channels + embed_dim, out_channels)
 
     def forward(self, x, edge_index, batch, embed):
         x = self.conv1(x, edge_index)
@@ -46,7 +46,7 @@ class GNN(torch.nn.Module):
         pooled = global_mean_pool(x, batch)
         x = torch.cat([pooled, embed], dim=1)
         out = self.lin(x)
-        return out  # Return embedding
+        return out
 
 class CyBrainOrchestrator:
     def __init__(self):
@@ -75,11 +75,11 @@ class CyBrainOrchestrator:
         """Load ML models and preprocessing utilities"""
         try:
             # Load ONNX autoencoder
-            self.onnx_session = ort.InferenceSession(str(self.models_dir / "autoencoder.onnx"))
+            self.onnx_session = ort.InferenceSession(str(self.models_dir / "vrains_autoencoder.onnx"))
 
             # Load PyTorch GNN
-            self.gnn_model = GNN(18, 64, 384)
-            self.gnn_model.load_state_dict(torch.load(str(self.models_dir / "gnn_model.pth")))
+            self.gnn_model = GNN(18, 64, 384, 384)
+            self.gnn_model.load_state_dict(torch.load(str(self.models_dir / "vrains_gnn_model.pth")))
             self.gnn_model.eval()
 
             # Load preprocessing
@@ -97,28 +97,18 @@ class CyBrainOrchestrator:
             sys.exit(1)
 
     def _load_mitre_data(self):
-        """Load MITRE ATT&CK data from STIX"""
+        """Load MITRE ATT&CK data"""
         try:
-            with open(self.data_dir / "enterprise-attack.json", "r") as f:
-                stix_data = json.load(f)
-
-            self.mitre_techniques = {}
+            self.mitre_techniques = {
+                "T1003": {"name": "OS Credential Dumping", "description": "Adversaries may attempt to dump credentials to obtain account login and credential material, normally in the form of a hash or a clear text password, from the operating system and software.", "tactic": "Credential Access"},
+                "T1048": {"name": "Exfiltration Over Alternative Protocol", "description": "Adversaries may steal data by exfiltrating it over a different protocol than the one used for initial command and control or to bypass network-based detection methods.", "tactic": "Exfiltration"},
+                "T1059": {"name": "Command and Scripting Interpreter", "description": "Adversaries may abuse command and script interpreters to execute commands, scripts, or binaries. These interfaces and languages provide ways of interacting with computer systems and are a common feature across many different platforms.", "tactic": "Execution"},
+                "T1486": {"name": "Data Encrypted for Impact", "description": "Adversaries may encrypt data on target systems or on large numbers of systems in a network to interrupt availability to system and network resources.", "tactic": "Impact"}
+            }
             self.technique_embeddings = {}
-
-            for obj in stix_data.get("objects", []):
-                if obj.get("type") == "attack-pattern":
-                    technique_id = obj.get("external_references", [{}])[0].get("external_id", "")
-                    if technique_id.startswith("T"):
-                        name = obj.get("name", "")
-                        description = obj.get("description", "")
-                        self.mitre_techniques[technique_id] = {
-                            "name": name,
-                            "description": description,
-                            "tactic": obj.get("kill_chain_phases", [{}])[0].get("phase_name", "")
-                        }
-                        # Create embedding for similarity search
-                        text = f"{name} {description}"
-                        self.technique_embeddings[technique_id] = self.embedder.encode(text)
+            # Embed descriptions
+            for tid, info in self.mitre_techniques.items():
+                self.technique_embeddings[tid] = self.embedder.encode(info["description"])
 
             logger.info(f"Loaded {len(self.mitre_techniques)} MITRE techniques")
         except Exception as e:
@@ -231,32 +221,24 @@ class CyBrainOrchestrator:
             return None
 
     def _analyze_with_gnn(self, graph: Data) -> Dict:
-        """Analyze with GNN for MITRE mapping using semantic similarity"""
+        """Analyze with GNN for MITRE mapping using embedding similarity"""
         try:
-            # Use zero embed for now (can be improved with event-specific embed)
+            # Zero embed for inference
             zero_embed = torch.zeros(1, 384)
             with torch.no_grad():
-                embedding = self.gnn_model(graph.x, graph.edge_index, graph.batch, zero_embed)
-                embedding = embedding.squeeze(0).numpy()
+                out_embed = self.gnn_model(graph.x, graph.edge_index, graph.batch, zero_embed)
+                out_embed = out_embed.squeeze()  # [384]
 
-            # Compute cosine similarity with all MITRE technique embeddings
-            similarities = {}
-            for tid, tech_embed in self.technique_embeddings.items():
-                sim = np.dot(embedding, tech_embed) / (np.linalg.norm(embedding) * np.linalg.norm(tech_embed))
-                similarities[tid] = sim
+                # Compute similarity to all technique embeddings
+                similarities = {}
+                for tid, tech_embed in self.technique_embeddings.items():
+                    tech_embed = torch.tensor(tech_embed, dtype=torch.float)
+                    sim = F.cosine_similarity(out_embed, tech_embed, dim=0).item()
+                    similarities[tid] = sim
 
-            # Find best match
-            if similarities:
+                # Find best match
                 best_tid = max(similarities, key=similarities.get)
                 confidence = similarities[best_tid]
-
-                if confidence < 0.5:  # Threshold for unknown
-                    return {
-                        "technique": "Anomalie Inconnue",
-                        "confidence": confidence,
-                        "tactic": "Unknown",
-                        "description": "Anomaly not matched to known MITRE technique"
-                    }
 
                 technique_info = self.mitre_techniques.get(best_tid, {})
                 return {
@@ -264,13 +246,6 @@ class CyBrainOrchestrator:
                     "confidence": confidence,
                     "tactic": technique_info.get("tactic", "Unknown"),
                     "description": technique_info.get("description", "")
-                }
-            else:
-                return {
-                    "technique": "No Techniques Loaded",
-                    "confidence": 0.0,
-                    "tactic": "Error",
-                    "description": "MITRE data not available"
                 }
         except Exception as e:
             logger.error(f"Failed GNN analysis: {e}")

@@ -1,0 +1,44 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: kprobe-network-process
+spec:
+  kprobes:
+    - call: sys_execve
+      args:
+        - index: 0
+          type: filename  # le nom du binaire
+        - index: 1
+          type: path      # les arguments
+    - call: sys_open
+      args:
+        - index: 0
+          type: path
+    - call: sys_connect
+      args:
+        - index: 0
+          type: int       # sockfd
+        - index: 1
+          type: sockaddr  # adresse
+        - index: 2
+          type: int       # addrlen
+    - call: sys_accept
+      args:
+        - index: 0
+          type: int
+        - index: 1
+          type: sockaddr
+        - index: 2
+          type: int
+    - call: sys_sendmsg
+      args:
+        - index: 0
+          type: int
+        - index: 1
+          type: iov_iter  # structure pour sendmsg
+    - call: sys_recvmsg
+      args:
+        - index: 0
+          type: int
+        - index: 1
+          type: iov_iter
